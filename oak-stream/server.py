@@ -152,7 +152,8 @@ def main():
 
     with dai.Pipeline(device) as pipeline:
         cam_node = pipeline.create(dai.node.Camera)
-        cam_out = cam_node.requestOutput((1920, 1080), dai.ImgFrame.Type.BGR888p, fps=args.fps)
+        cam_node.build(fps=args.fps)
+        cam_out = cam_node.requestOutput((1920, 1080), dai.ImgFrame.Type.BGR888p)
         pipeline.create(MJPEGStreamer).build(cam_out, port=args.port)
         print(f"[oak-stream] Pipeline running — press Ctrl+C to stop")
         pipeline.run()
