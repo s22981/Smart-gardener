@@ -2,50 +2,36 @@
 """
 OAK-4 MJPEG Streaming Server
 
-Connects to a Luxonis OAK-4 device, captures the main camera,
-and streams it as MJPEG over HTTP.
+Streams the main camera from a connected Luxonis OAK device over HTTP
+using the depthai v3 HostNode API. No AI model required.
 
 Usage:
     pip install -r requirements.txt
     python server.py
 
-Then open http://localhost:8080 in your browser.
-Optional: python server.py --port 9000 --fps 30 --width 1280 --height 720
+Open http://localhost:8083 in your browser.
+Optional flags:
+    --port 9000
+    --fps  25
 """
 
 import argparse
 import threading
-import time
-import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from time import sleep
 
-try:
-    import cv2
-except ImportError:
-    sys.exit("Missing dependency: pip install opencv-python")
+import cv2
+import depthai as dai
 
-try:
-    import depthai as dai
-except ImportError:
-    sys.exit("Missing dependency: pip install depthai")
+DEFAULT_PORT = 8083
+DEFAULT_FPS  = 30
 
-try:
-    from flask import Flask, Response
-except ImportError:
-    sys.exit("Missing dependency: pip install flask")
-
-
-app = Flask(__name__)
-
-_frame_lock = threading.Lock()
-_current_frame = None
-_camera_error = None
-
-
-INDEX_HTML = """<!DOCTYPE html>
+INDEX_HTML = b"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>OAK-4 Live Stream</title>
+  <title>OAK Live Stream</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -57,120 +43,107 @@ INDEX_HTML = """<!DOCTYPE html>
       align-items: center;
       justify-content: center;
       min-height: 100vh;
-      gap: 12px;
+      gap: 10px;
     }
-    h1 { font-size: 1rem; letter-spacing: 0.05em; opacity: 0.5; }
-    img {
-      max-width: 100%;
-      max-height: 90vh;
-      display: block;
-      border: 1px solid #333;
-    }
-    #status { font-size: 0.8rem; opacity: 0.4; }
+    h1 { font-size: 0.9rem; letter-spacing: 0.1em; opacity: 0.4; text-transform: uppercase; }
+    img { max-width: 100%; max-height: 90vh; display: block; }
+    p  { font-size: 0.75rem; opacity: 0.3; }
   </style>
 </head>
 <body>
-  <h1>OAK-4 LIVE</h1>
-  <img src="/stream" alt="OAK-4 stream"
-       onerror="document.getElementById('status').textContent = 'Stream error — is the device connected?'" />
-  <p id="status">Connecting…</p>
-  <script>
-    const img = document.querySelector('img');
-    img.onload = () => document.getElementById('status').textContent = 'Streaming';
-  </script>
+  <h1>OAK Live</h1>
+  <img src="/stream" alt="camera stream" />
+  <p>MJPEG &mdash; refreshes automatically</p>
 </body>
 </html>"""
 
 
-@app.route('/')
-def index():
-    return INDEX_HTML
+class VideoStreamHandler(BaseHTTPRequestHandler):
+    """Serves the HTML viewer on / and the MJPEG stream on /stream."""
 
+    def log_message(self, *args):
+        pass  # silence per-request logs
 
-def _generate_frames(quality: int):
-    global _current_frame
-    while True:
-        with _frame_lock:
-            frame = _current_frame
+    def do_GET(self):
+        if self.path == "/stream":
+            self._serve_stream()
+        else:
+            self._serve_html()
 
-        if frame is None:
-            time.sleep(0.02)
-            continue
+    def _serve_html(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(INDEX_HTML)))
+        self.end_headers()
+        self.wfile.write(INDEX_HTML)
 
-        ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        if not ret:
-            continue
-
-        yield (
-            b'--frame\r\n'
-            b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n'
+    def _serve_stream(self):
+        self.send_response(200)
+        self.send_header(
+            "Content-Type", "multipart/x-mixed-replace; boundary=--jpgboundary"
         )
+        self.end_headers()
+        while True:
+            sleep(0.03)
+            frame = getattr(self.server, "frametosend", None)
+            if frame is None:
+                continue
+            ok, encoded = cv2.imencode(".jpg", frame)
+            if not ok:
+                continue
+            try:
+                self.wfile.write(b"--jpgboundary\r\n")
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded.tobytes())
+                self.wfile.write(b"\r\n")
+            except BrokenPipeError:
+                break
 
 
-@app.route('/stream')
-def stream():
-    quality = app.config.get('JPEG_QUALITY', 85)
-    return Response(
-        _generate_frames(quality),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handles each connection in its own thread."""
+    pass
 
 
-def _camera_thread(width: int, height: int, fps: int):
-    global _current_frame, _camera_error
+class MJPEGStreamer(dai.node.HostNode):
+    """
+    depthai v3 HostNode that receives ImgFrames from the pipeline
+    and pushes them to the HTTP server for MJPEG streaming.
+    """
 
-    pipeline = dai.Pipeline()
+    def build(self, camera_output: dai.Node.Output, port: int) -> "MJPEGStreamer":
+        self.link_args(camera_output)
+        self.sendProcessingToPipeline(True)
 
-    cam = pipeline.create(dai.node.Camera)
-    cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-    cam.setFps(fps)
+        self.server = ThreadedHTTPServer(("0.0.0.0", port), VideoStreamHandler)
+        t = threading.Thread(target=self.server.serve_forever, daemon=True)
+        t.start()
+        print(f"[oak-stream] Viewer  →  http://localhost:{port}")
+        print(f"[oak-stream] Stream  →  http://localhost:{port}/stream")
+        return self
 
-    # Resize via ImageManip so we control output resolution
-    manip = pipeline.create(dai.node.ImageManip)
-    manip.initialConfig.setResize(width, height)
-    manip.initialConfig.setFrameType(dai.ImgFrame.Type.BGR888p)
-    manip.setMaxOutputFrameSize(width * height * 3)
-    cam.isp.link(manip.inputImage)
-
-    xout = pipeline.create(dai.node.XLinkOut)
-    xout.setStreamName("video")
-    manip.out.link(xout.input)
-
-    try:
-        with dai.Device(pipeline) as device:
-            queue = device.getOutputQueue("video", maxSize=4, blocking=False)
-            print(f"[oak-stream] Camera ready — streaming {width}x{height} @ {fps} fps")
-            while True:
-                msg = queue.get()
-                img = msg.getCvFrame()
-                with _frame_lock:
-                    _current_frame = img
-    except Exception as exc:
-        _camera_error = str(exc)
-        print(f"[oak-stream] Camera error: {exc}", file=sys.stderr)
+    def process(self, frame: dai.Buffer) -> None:
+        assert isinstance(frame, dai.ImgFrame)
+        self.server.frametosend = frame.getCvFrame()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OAK-4 MJPEG streaming server")
-    parser.add_argument('--port',    type=int, default=8080,  help='HTTP port (default: 8080)')
-    parser.add_argument('--fps',     type=int, default=30,    help='Camera FPS (default: 30)')
-    parser.add_argument('--width',   type=int, default=1280,  help='Frame width  (default: 1280)')
-    parser.add_argument('--height',  type=int, default=720,   help='Frame height (default: 720)')
-    parser.add_argument('--quality', type=int, default=85,    help='JPEG quality 1-100 (default: 85)')
+    parser = argparse.ArgumentParser(description="OAK MJPEG streaming server")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"HTTP port (default: {DEFAULT_PORT})")
+    parser.add_argument("--fps",  type=int, default=DEFAULT_FPS,  help=f"Camera FPS (default: {DEFAULT_FPS})")
+    parser.add_argument("--device", type=str, default=None, help="Device name, ID, or IP (default: auto-detect)")
     args = parser.parse_args()
 
-    app.config['JPEG_QUALITY'] = args.quality
+    device = dai.Device(dai.DeviceInfo(args.device)) if args.device else dai.Device()
 
-    t = threading.Thread(
-        target=_camera_thread,
-        args=(args.width, args.height, args.fps),
-        daemon=True
-    )
-    t.start()
-
-    print(f"[oak-stream] Open http://localhost:{args.port} in your browser")
-    app.run(host='0.0.0.0', port=args.port, threaded=True)
+    with dai.Pipeline(device) as pipeline:
+        cam = pipeline.create(dai.node.Camera).build(fps=args.fps)
+        pipeline.create(MJPEGStreamer).build(cam, port=args.port)
+        print(f"[oak-stream] Pipeline running — press Ctrl+C to stop")
+        pipeline.run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

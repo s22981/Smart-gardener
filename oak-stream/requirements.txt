@@ -1,3 +1,4 @@
-depthai>=2.28
-opencv-python>=4.8
-flask>=3.0
+--extra-index-url https://artifacts.luxonis.com/artifactory/luxonis-python-snapshot-local/
+depthai==3.6.1
+opencv-python-headless~=4.10.0
+numpy>=1.22
